@@ -6,12 +6,24 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, LaserScan
 from std_msgs.msg import String
 from geometry_msgs.msg import Quaternion
-from math import sin, cos
+from math import sin, cos, pi
 
+# --- CONFIGURATION RÉSEAU ---
 UDP_IP = "0.0.0.0"
 UDP_PORT_RECV = 12346 
-ESP32_IP = "172.20.10.2" # <--- TON IP ESP32
+ESP32_IP = "172.20.10.2" # <--- METS L'IP DE TON ESP32 ICI
 ESP32_PORT_SEND = 12345
+
+# --- PARAMÈTRES PHYSIQUES DU ROBOT ---
+TICKS_PER_REV = 20.0   
+WHEEL_RADIUS = 0.033   
+WHEEL_BASE = 0.18      
+METERS_PER_TICK = (2 * pi * WHEEL_RADIUS) / TICKS_PER_REV
+
+# --- CORRECTION DES SIGNES ---
+# Inversion des deux pour corriger Avancer/Reculer ET Gauche/Droite
+FIX_ENCODER_G = 1   # Changé de -1 à 1
+FIX_ENCODER_D = -1  # Changé de 1 à -1
 
 class RobotBrain:
     def __init__(self):
@@ -22,15 +34,13 @@ class RobotBrain:
         self.sock_recv.bind((UDP_IP, UDP_PORT_RECV))
         self.sock_recv.setblocking(False)
 
-        # Variables d'état
         self.auto_mode = False
         self.x, self.y, self.th = 0.0, 0.0, 0.0
-        self.L, self.R = 0.25, 0.05
         self.last_enc_g, self.last_enc_d = 0.0, 0.0
+        self.first_data = True
 
-        # ROS
-        self.odom_pub = rospy.Publisher("/odom", Odometry, queue_size=50)
-        self.joint_pub = rospy.Publisher("/joint_states", JointState, queue_size=50)
+        self.odom_pub = rospy.Publisher("/odom", Odometry, queue_size=10)
+        self.joint_pub = rospy.Publisher("/joint_states", JointState, queue_size=10)
         self.tf_broadcaster = tf.TransformBroadcaster()
         
         rospy.Subscriber("/scan", LaserScan, self.lidar_callback)
@@ -38,55 +48,56 @@ class RobotBrain:
 
     def mode_callback(self, msg):
         self.auto_mode = (msg.data == "AUTO")
-        rospy.loginfo(f"Mode changé en : {msg.data}")
 
     def lidar_callback(self, data):
-        # Analyse du cône devant le robot
-        front = data.ranges[0:20] + data.ranges[340:360]
-        points = [d for d in front if d > 0.02]
-        
+        front_ranges = data.ranges[0:15] + data.ranges[345:360]
+        points = [d for d in front_ranges if d > 0.02]
         if points:
             min_dist = min(points)
-            
-            # --- COMPORTEMENT EN MODE AUTOMATIQUE ---
-            if self.auto_mode:
-                if min_dist < 0.25: # Si obstacle à 25cm, on tourne
-                    rospy.loginfo("AUTO: Obstacle ! Rotation Gauche")
-                    self.sock_send.sendto("3".encode(), (ESP32_IP, ESP32_PORT_SEND))
-                else: # Sinon, on avance
-                    self.sock_send.sendto("1".encode(), (ESP32_IP, ESP32_PORT_SEND))
-            
-            # --- SÉCURITÉ 5CM (Toujours active, même en manuel) ---
-            elif min_dist < 0.06: # On met 6cm pour avoir une marge sur les 5cm
-                rospy.logwarn(f"DANGER : Obstacle à {min_dist*100:.1f}cm ! STOP")
+            if min_dist < 0.06: 
                 self.sock_send.sendto("5".encode(), (ESP32_IP, ESP32_PORT_SEND))
+            elif self.auto_mode:
+                if min_dist < 0.30: 
+                    self.sock_send.sendto("3".encode(), (ESP32_IP, ESP32_PORT_SEND))
+                else:
+                    self.sock_send.sendto("1".encode(), (ESP32_IP, ESP32_PORT_SEND))
 
     def run(self):
+        rospy.loginfo("Odométrie : Signes inversés pour corriger la direction.")
         while not rospy.is_shutdown():
             try:
                 data, addr = self.sock_recv.recvfrom(1024)
-                enc_g, enc_d = map(float, data.decode().split(','))
+                raw_g, raw_d = map(float, data.decode().split(','))
                 
-                # Odométrie
-                dg, dd = enc_g - self.last_enc_g, enc_d - self.last_enc_d
-                dist, dth = (dg + dd) / 2.0, (dd - dg) / self.L
+                # Application des nouveaux signes correctifs
+                enc_g = raw_g * FIX_ENCODER_G
+                enc_d = raw_d * FIX_ENCODER_D
+                
+                if self.first_data:
+                    self.last_enc_g, self.last_enc_d = enc_g, enc_d
+                    self.first_data = False
+                    continue
+
+                # Calcul des deltas (en mètres)
+                d_left = (enc_g - self.last_enc_g) * METERS_PER_TICK
+                d_right = (enc_d - self.last_enc_d) * METERS_PER_TICK
+
+                # Calcul du déplacement
+                dist = (d_right + d_left) / 2.0
+                d_th = (d_right - d_left) / WHEEL_BASE
+
+                # Mise à jour de la position globale
                 self.x += dist * cos(self.th)
                 self.y += dist * sin(self.th)
-                self.th += dth
+                self.th += d_th
 
                 now = rospy.Time.now()
                 odom_quat = tf.transformations.quaternion_from_euler(0, 0, self.th)
 
-                # JointStates (Roues)
-                js = JointState()
-                js.header.stamp = now
-                js.name = ['joint_rear_left_wheel', 'joint_front_left_wheel', 'joint_rear_right_wheel', 'joint_front_right_wheel']
-                js.position = [enc_g/self.R, enc_g/self.R, enc_d/self.R, enc_d/self.R]
-                self.joint_pub.publish(js)
-
-                # TF & Odometry (Pour le SLAM)
+                # 1. TF odom -> base_link
                 self.tf_broadcaster.sendTransform((self.x, self.y, 0), odom_quat, now, "base_link", "odom")
                 
+                # 2. Message Odometry
                 o = Odometry()
                 o.header.stamp, o.header.frame_id = now, "odom"
                 o.child_frame_id = "base_link"
@@ -94,7 +105,16 @@ class RobotBrain:
                 o.pose.pose.orientation = Quaternion(*odom_quat)
                 self.odom_pub.publish(o)
 
+                # 3. Message JointStates
+                js = JointState()
+                js.header.stamp = now
+                js.name = ['joint_rear_left_wheel', 'joint_front_left_wheel', 'joint_rear_right_wheel', 'joint_front_right_wheel']
+                pos_g, pos_d = enc_g * (2*pi/TICKS_PER_REV), enc_d * (2*pi/TICKS_PER_REV)
+                js.position = [pos_g, pos_g, pos_d, pos_d]
+                self.joint_pub.publish(js)
+
                 self.last_enc_g, self.last_enc_d = enc_g, enc_d
+
             except:
                 continue
             rospy.sleep(0.01)

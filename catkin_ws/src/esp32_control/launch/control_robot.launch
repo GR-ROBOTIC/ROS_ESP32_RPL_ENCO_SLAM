@@ -1,14 +1,15 @@
 <launch>
-  <param name="robot_description" textfile="$(find esp32_control)/urdf/robot.urdf" />
+  <param name="robot_description" textfile="$(find esp32_control)/urdf/robot_physique.urdf" />
 
   <node name="rplidarNode" pkg="rplidar_ros" type="rplidarNode" output="screen">
       <param name="serial_port"         type="string" value="/dev/ttyUSB1"/>
       <param name="serial_baudrate"     type="int"    value="115200"/>
-      <param name="frame_id"            type="string" value="laser"/> <param name="inverted"            type="bool"   value="false"/>
+      <param name="frame_id"            type="string" value="laser"/> 
+      <param name="inverted" type="bool"   value="false"/>
       <param name="angle_compensate"    type="bool"   value="true"/>
   </node>
-
-  <node name="esp32_odom" pkg="esp32_control" type="esp32_odom.py" output="screen" />
+  <node name="esp32_odom" pkg="esp32_control" type="odom_virtual.py" output="screen" />
+  <!--node name="esp32_odom" pkg="esp32_control" type="esp32_odom.py" output="screen" / -->
   <node name="robot_gui" pkg="esp32_control" type="ros_gui_control.py" output="screen" />
   <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
   
